@@ -18,12 +18,14 @@ package kube // import "helm.sh/helm/v3/pkg/kube"
 
 import (
 	"context"
+	"log"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
@@ -319,6 +321,61 @@ func Test_ReadyChecker_volumeReady(t *testing.T) {
 	}
 }
 
+func Test_ReadyChecker_extractObject(t *testing.T) {
+	type args struct {
+		u runtime.Object
+	}
+	tests := []struct {
+		name   string
+		args   args
+		filter string
+		want   bool
+	}{
+		{
+			name: "pass readiness",
+			args: args{
+				u: newUnstructured("Completed", ".status.level.nested=Completed"),
+			},
+			filter: ".status.level.nested=Completed",
+			want:   true,
+		},
+		{
+			name: "fail readiness",
+			args: args{
+				u: newUnstructured("Completed", ".status.level.nested=Completed"),
+			},
+			filter: ".status.level.nested=Failed",
+			want:   false,
+		},
+		{
+			name: "no readiness",
+			args: args{
+				u: newUnstructured("Completed", ""),
+			},
+			filter: ".status.level.nested=Failed",
+			want:   false,
+		},
+		{
+			name: "incorrect readiness",
+			args: args{
+				u: newUnstructured("Completed", ".status.level.nested=Completed"),
+			},
+			filter: "incorrect",
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewReadyChecker(fake.NewSimpleClientset(), nil)
+
+			if got, _ := c.extractObject(tt.args.u, tt.filter); got != tt.want {
+				t.Errorf("annotation = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func newDaemonSet(name string, maxUnavailable, numberReady, desiredNumberScheduled, updatedNumberScheduled int) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -509,6 +566,51 @@ func newJob(name string, backoffLimit, completions, succeeded, failed int) *batc
 			Failed:    int32(failed),
 		},
 	}
+}
+
+func newUnstructured(status string, match string) runtime.Object {
+	var unknown unstructured.Unstructured
+
+	type temp struct {
+		ObjectMeta metav1.ObjectMeta `json:"metadata"`
+		Status     struct {
+			Level struct {
+				Nested string `json:"nested"`
+			} `json:"level"`
+		} `json:"status"`
+	}
+
+	t := temp{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "readiness",
+			Namespace:    defaultNamespace,
+		},
+		Status: struct {
+			Level struct {
+				Nested string `json:"nested"`
+			} `json:"level"`
+		}{
+			Level: struct {
+				Nested string `json:"nested"`
+			}{
+				Nested: status,
+			},
+		},
+	}
+
+	if match != "" {
+		t.ObjectMeta.Annotations = map[string]string{
+			readinessField: match,
+		}
+	}
+	unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&t)
+	if err != nil {
+		log.Println(err)
+	}
+
+	unknown.SetUnstructuredContent(unstructuredObj)
+
+	return &unknown
 }
 
 func intToInt32(i int) *int32 {

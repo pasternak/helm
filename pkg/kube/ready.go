@@ -18,6 +18,10 @@ package kube // import "helm.sh/helm/v3/pkg/kube"
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	appsv1beta1 "k8s.io/api/apps/v1beta1"
@@ -33,12 +37,17 @@ import (
 	"k8s.io/cli-runtime/pkg/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/jsonpath"
+	"k8s.io/kubectl/pkg/cmd/get"
 
 	deploymentutil "helm.sh/helm/v3/internal/third_party/k8s.io/kubernetes/deployment/util"
 )
 
 // ReadyCheckerOption is a function that configures a ReadyChecker.
 type ReadyCheckerOption func(*ReadyChecker)
+
+// Custom Resource readiness annotation
+const readinessField = "helm.sh/readiness-field"
 
 // PausedAsReady returns a ReadyCheckerOption that configures a ReadyChecker
 // to consider paused resources to be ready. For example a Deployment
@@ -182,11 +191,51 @@ func (c *ReadyChecker) IsReady(ctx context.Context, v *resource.Info) (bool, err
 		}
 	case *corev1.ReplicationController, *extensionsv1beta1.ReplicaSet, *appsv1beta2.ReplicaSet, *appsv1.ReplicaSet:
 		ok, err = c.podsReadyForObject(ctx, v.Namespace, value)
+	default:
+		if annotation, found := getReadinessAnnotations(v.Object, readinessField); found {
+			ok, err = c.extractObject(v.Object, annotation)
+		}
 	}
 	if !ok || err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func (c *ReadyChecker) extractObject(from runtime.Object, annotation string) (bool, error) {
+	var elems [][]reflect.Value
+
+	expression := strings.Split(annotation, "=")
+	if len(expression) != 2 {
+		return false, fmt.Errorf("expected match 'key=value' expression, got %s", annotation)
+	}
+
+	fields, err := get.RelaxedJSONPathExpression(expression[0])
+	if err != nil {
+		return false, err
+	}
+
+	parser := jsonpath.New("select").AllowMissingKeys(true)
+
+	err = parser.Parse(fields)
+	if err != nil {
+		return false, err
+	}
+
+	elems, err = parser.FindResults(from.(runtime.Unstructured).UnstructuredContent())
+	if err != nil {
+		return false, err
+	}
+
+	if len(elems) != 1 {
+		return false, fmt.Errorf("expected to find 1 match, found %d, %v", len(elems), elems)
+	}
+
+	if len(elems[0]) != 1 {
+		return false, nil
+	}
+
+	return elems[0][0].Interface().(string) == expression[1], nil
 }
 
 func (c *ReadyChecker) podsReadyForObject(ctx context.Context, namespace string, obj runtime.Object) (bool, error) {
@@ -394,4 +443,28 @@ func getPods(ctx context.Context, client kubernetes.Interface, namespace, select
 		LabelSelector: selector,
 	})
 	return list.Items, err
+}
+
+func getReadinessAnnotations(obj runtime.Object, annotation string) (string, bool) {
+	var objectMap map[string]interface{}
+
+	temp, err := json.Marshal(obj)
+	if err != nil {
+		return "", false
+	}
+
+	if err := json.Unmarshal(temp, &objectMap); err != nil {
+		return "", false
+	}
+
+	annotations, ok := objectMap["metadata"].(map[string]interface{})["annotations"]
+	if !ok {
+		return "", false
+	}
+
+	if readinessAnnotation, ok := annotations.(map[string]interface{})[annotation]; ok {
+		return readinessAnnotation.(string), true
+	}
+
+	return "", false
 }
